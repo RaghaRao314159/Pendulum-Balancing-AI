@@ -7,6 +7,8 @@ from matplotlib.pyplot import ion, draw, Rectangle, Line2D
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('TkAgg') 
+import jax.numpy as jnp
+import jax
 
 # If theta  has gone past our conceptual limits of [-pi,pi]
 # map it onto the equivalent angle that is in the accepted range (by adding or subtracting 2pi)
@@ -20,6 +22,17 @@ def _remap_angle(theta):
     while theta > np.pi:
         theta -= 2. * np.pi
     return theta
+
+def remap_angle_j(theta):
+    return _remap_angle_j(theta)
+
+def _remap_angle_j(theta):
+    """Remap angle to be within [-pi, pi] using jax"""
+    # account for fact that theta can be more than multiple of 2pi 
+    theta = theta % (2. * jnp.pi)
+    theta = jax.lax.cond(theta < -jnp.pi, lambda x: x + 2. * jnp.pi, lambda x: x, theta)
+    theta = jax.lax.cond(theta > jnp.pi, lambda x: x - 2. * jnp.pi, lambda x: x, theta)
+    return theta
     
 
 ## loss function given a state vector. the elements of the state vector are
@@ -30,6 +43,33 @@ def _loss(state):
 
 def loss(state):
     return _loss(state)
+
+# jax version of euler_integration
+def eulerStep_j(state, force, params):
+    # state: [cart_location, cart_velocity, pole_angle, pole_velocity]
+    cart_location, cart_velocity, pole_angle, pole_velocity = state
+    cart_mass, pole_mass, pole_length, mu_c, mu_p, gravity, max_force, delta_time = params
+    s = jnp.sin(pole_angle)
+    c = jnp.cos(pole_angle)
+    m = 4.0*(cart_mass+pole_mass)-3.0*pole_mass*(c**2)
+
+    cart_accel = (2.0*(pole_length*pole_mass*(pole_velocity**2)*s+2.0*(force-mu_c*cart_velocity))\
+        -3.0*pole_mass*gravity*c*s + 6.0*mu_p*pole_velocity*c/pole_length)/m
+
+    pole_accel = (-3.0*c*(2.0/pole_length)*(pole_length/2.0*pole_mass*(pole_velocity**2)*s + force-mu_c*cart_velocity)+\
+        6.0*(cart_mass+pole_mass)/(pole_mass*pole_length)*\
+        (pole_mass*gravity*s - 2.0/pole_length*mu_p*pole_velocity) \
+        )/m
+
+    # Update state variables
+    dt = delta_time
+    # Do the updates in this order, so that we get semi-implicit Euler that is simplectic rather than forward-Euler which is not.
+    cart_velocity += dt * cart_accel
+    pole_velocity += dt * pole_accel
+    pole_angle    += dt * pole_velocity
+    cart_location += dt * cart_velocity
+
+    return jnp.array([cart_location, cart_velocity, pole_angle, pole_velocity]), None  # No carry value needed for this scan step
 
 class CartPole:
     """Cart Pole environment. This implementation allows multiple poles,
@@ -46,6 +86,7 @@ class CartPole:
         self.cart_location = 0.0
         self.cart_velocity = 0.0
         self.pole_angle = np.pi    # angle is defined to be zero when the pole is upright, pi when hanging vertically down
+        self.pole_angle_j = jnp.pi
         self.pole_velocity = 0.0
         self.visual = visual
 
@@ -85,12 +126,26 @@ class CartPole:
              self.pole_angle,
              self.pole_velocity]
         )
+    
+    def getState_j(self):
+        return jnp.array(
+            [self.cart_location,
+             self.cart_velocity,
+             self.pole_angle,
+             self.pole_velocity]
+        )
 
     # reset the state vector to the initial state (down-hanging pole)
     def reset(self):
         self.cart_location = 0.0
         self.cart_velocity = 0.0
         self.pole_angle = np.pi
+        self.pole_velocity = 0.0
+    
+    def reset_j(self):
+        self.cart_location = 0.0
+        self.cart_velocity = 0.0
+        self.pole_angle = jnp.pi
         self.pole_velocity = 0.0
 
     # This is where the equations of motion are implemented
@@ -123,10 +178,40 @@ class CartPole:
         if self.visual:
             self._render()
 
+
+    # This is where the equations of motion are implemented
+    def performAction_j(self, action = 0.0):
+        # prevent the force from being too large
+        force = self.max_force * jnp.tanh(action/self.max_force)
+
+        params = (
+            self.cart_mass,
+            self.pole_mass,
+            self.pole_length,
+            self.mu_c,
+            self.mu_p,
+            self.gravity,
+            self.max_force,
+            self.delta_time / float(self.sim_steps),
+        )
+        state = jnp.array([self.cart_location, self.cart_velocity, self.pole_angle, self.pole_velocity])
+
+        def scan_step(state, _):
+            return eulerStep_j(state, force, params)
+
+        # Run scan for sim_steps
+        state, _ = jax.lax.scan(scan_step, state, None, length=self.sim_steps)
+
+        # Update the object's state
+        self.cart_location, self.cart_velocity, self.pole_angle, self.pole_velocity = state[0], state[1], state[2], state[3]
+
     # remapping as a member function
     def remap_angle(self):
         self.pole_angle = _remap_angle(self.pole_angle)
-    
+
+    def remap_angle_j(self):
+        self.pole_angle = _remap_angle_j(self.pole_angle)
+
     # the loss function that the policy will try to optimise (lower) as a member function
     def loss(self):
         return _loss(self.getState())
