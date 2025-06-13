@@ -71,6 +71,53 @@ def eulerStep_j(state, force, params):
 
     return jnp.array([cart_location, cart_velocity, pole_angle, pole_velocity]), None  # No carry value needed for this scan step
 
+g = 9.8  # gravity
+mass_cart = 0.5
+mass_pole = 0.5
+mu_c = 0.001
+mu_p = 0.001
+l = 0.5  # pole length
+max_force = 5.0
+delta_time = 0.1
+sim_steps = 50
+dt = delta_time / sim_steps
+
+@jax.jit
+def remap_angle2(theta):
+    return jnp.mod(theta + jnp.pi, 2 * jnp.pi) - jnp.pi
+
+@jax.jit
+def cartpole_dynamics(state, force, max_force=max_force):
+    force = max_force * jnp.tanh(force/max_force)
+    x, x_dot, theta, theta_dot = state
+
+    s = jnp.sin(theta)
+    c = jnp.cos(theta)
+    m = 4.0 * (mass_cart + mass_pole) - 3.0 * mass_pole * c**2
+
+    cart_accel = (2.0 * (l * mass_pole * theta_dot**2 * s + 2.0 * (force - mu_c * x_dot)) -
+                  3.0 * mass_pole * g * c * s + 6.0 * mu_p * theta_dot * c / l) / m
+
+    pole_accel = (-3.0 * c * (2.0 / l) * (l / 2.0 * mass_pole * theta_dot**2 * s + force - mu_c * x_dot) +
+                  6.0 * (mass_cart + mass_pole) / (mass_pole * l) *
+                  (mass_pole * g * s - 2.0 / l * mu_p * theta_dot)) / m
+
+    x_dot_new = x_dot + dt * cart_accel
+    theta_dot_new = theta_dot + dt * pole_accel
+    theta_new = theta + dt * theta_dot_new
+    x_new = x + dt * x_dot_new
+
+    return jnp.array([x_new, x_dot_new, remap_angle2(theta_new), theta_dot_new])
+    # return jnp.array([x_new, x_dot_new, remap_angle2(theta_new), theta_dot_new])
+    
+@jax.jit
+def cartpole_step(state, force, max_force=max_force):
+    def body_fn(i, state):
+        return cartpole_dynamics(state, force, max_force=max_force)
+
+    return jax.lax.fori_loop(0, sim_steps, body_fn, state)
+
+
 class CartPole:
     """Cart Pole environment. This implementation allows multiple poles,
     noisy action, and random starts. It has been checked repeatedly for
@@ -82,7 +129,7 @@ class CartPole:
     of round off errors that cause the oscillations to grow until it eventually falls.
     """
 
-    def __init__(self, visual=False):
+    def __init__(self, visual=False, max_force=20):
         self.cart_location = 0.0
         self.cart_velocity = 0.0
         self.pole_angle = np.pi    # angle is defined to be zero when the pole is upright, pi when hanging vertically down
@@ -102,7 +149,7 @@ class CartPole:
         # self.sim_steps = 5000
         self.delta_time = 0.1       # time step of the Euler integrator
         # self.delta_time = 0.001       # time step of the Euler integrator
-        self.max_force = 20.
+        self.max_force = max_force
         self.gravity = 9.8
         self.cart_mass = 0.5
 
@@ -177,7 +224,41 @@ class CartPole:
 
         if self.visual:
             self._render()
+        
+    def performAction_noise(self, action, std):
+        # prevent the force from being too large
+        force = self.max_force * np.tanh(action/self.max_force)
 
+        # integrate forward the equations of motion using the Euler method
+        for step in range(self.sim_steps):
+            s = np.sin(self.pole_angle)
+            c = np.cos(self.pole_angle)
+            m = 4.0*(self.cart_mass+self.pole_mass)-3.0*self.pole_mass*(c**2)
+            
+            cart_accel = (2.0*(self.pole_length*self.pole_mass*(self.pole_velocity**2)*s+2.0*(force-self.mu_c*self.cart_velocity))\
+                -3.0*self.pole_mass*self.gravity*c*s + 6.0*self.mu_p*self.pole_velocity*c/self.pole_length)/m
+            
+            pole_accel = (-3.0*c*(2.0/self.pole_length)*(self.pole_length/2.0*self.pole_mass*(self.pole_velocity**2)*s + force-self.mu_c*self.cart_velocity)+\
+                6.0*(self.cart_mass+self.pole_mass)/(self.pole_mass*self.pole_length)*\
+                (self.pole_mass*self.gravity*s - 2.0/self.pole_length*self.mu_p*self.pole_velocity) \
+                )/m
+
+            # Update state variables
+            dt = (self.delta_time / float(self.sim_steps))
+            # Do the updates in this order, so that we get semi-implicit Euler that is simplectic rather than forward-Euler which is not. 
+            self.cart_velocity += dt * cart_accel
+            self.pole_velocity += dt * pole_accel
+            self.pole_angle    += dt * self.pole_velocity
+            self.cart_location += dt * self.cart_velocity
+
+        noise = np.random.normal(0, std, 4)
+        self.cart_location += noise[0]
+        self.cart_velocity += noise[1]
+        self.pole_angle    += noise[2]
+        self.pole_velocity += noise[3]
+
+        if self.visual:
+            self._render()
 
     # This is where the equations of motion are implemented
     def performAction_j(self, action = 0.0):
